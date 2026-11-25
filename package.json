@@ -1,7 +1,7 @@
 {
   "name": "ps7-bootstrap",
-  "description": "Install PowerShell 7, wire it into Windows, and pin the harness shell to it.",
-  "version": "0.2.1",
+  "description": "Install PowerShell 7 on Windows and pin the DeepSeek Harness shell to it.",
+  "version": "0.2.2",
   "icon": "./icon.svg",
   "type": "module",
   "main": "index.js",
@@ -14,6 +14,7 @@
   },
   "files": [
     "README.md",
+    "LICENSE",
     "icon.svg",
     "locale/*.json",
     "docs",
@@ -21,7 +22,27 @@
     "cordis.patch.yml",
     "scripts/ps7-bootstrap.ps1"
   ],
+  "keywords": [
+    "powershell",
+    "powershell-7",
+    "pwsh",
+    "windows",
+    "windows-terminal",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "bootstrap"
+  ],
+  "author": "ltw2522",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ltw2522/ps7-bootstrap.git"
+  },
+  "homepage": "https://github.com/ltw2522/ps7-bootstrap#readme",
+  "bugs": {
+    "url": "https://github.com/ltw2522/ps7-bootstrap/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
