@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "PowerShell 7 bootstrap",
+    "description": "Installs PowerShell 7 side by side with the built-in Windows PowerShell, wires it into the places you actually launch a shell from, and pins the harness's own command executor to it. Runs as a normal user: the install is a per-user MSIX package and every integration point lives under the current user's registry hive.",
+    "detail": "docs/DETAIL.md"
+  }
+}
