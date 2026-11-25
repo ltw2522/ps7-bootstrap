@@ -1,0 +1,30 @@
+{
+  "name": "ps7-bootstrap",
+  "description": "Install PowerShell 7, wire it into Windows, and pin the harness shell to it.",
+  "version": "0.2.1",
+  "icon": "./icon.svg",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "README.md",
+    "icon.svg",
+    "locale/*.json",
+    "docs",
+    "index.js",
+    "cordis.patch.yml",
+    "scripts/ps7-bootstrap.ps1"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
