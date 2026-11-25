@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "PowerShell 7 引导",
+    "description": "把 PowerShell 7 与系统自带的 Windows PowerShell 并存装好，接入你实际启动 shell 的那些入口，并把 harness 自己的命令执行器钉到 7 上。全程以普通用户身份完成：安装是当前用户的 MSIX 包，各集成点也都只写当前用户的注册表配置单元。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}
