@@ -13,13 +13,16 @@
 
 .PARAMETER Action
     detect    只读检测，不改任何配置
+    plan      只读：列出「将会改动哪些设置」，逐条给出状态（已就绪 / 待改动 / 无法执行）
+    confirm   先弹确认窗口，把将改动的项、落点、备份位置逐条摊给用户看，勾选后才执行
+              （插件加载时的默认动作；用户关掉窗口则一个字节都不改）
     install   下载并安装 PowerShell 7（MSIX 用户级，免管理员）
     integrate 写系统集成项（终端默认 / 终端委托 / 右键菜单 / App Paths / .ps1 关联）
     lock      把 DSH 的 shell 执行器锁定到 PowerShell 7
     verify    全量校验
     all       依次执行 install → integrate → lock → verify
     auto      智能引导：先做一次廉价判定，已就绪就一步不动；有缺口才走完整流程。
-              插件每次加载都会调它，所以绝不能无条件全量跑。
+              不具备交互条件时（例如无人值守脚本）才用这个，它不会询问用户。
 
 .PARAMETER Version
     目标版本号，默认 7.7.0；需与 GitHub release 的 tag 一致。
@@ -37,7 +40,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('detect', 'install', 'integrate', 'lock', 'verify', 'all', 'auto')]
+    [ValidateSet('detect', 'plan', 'confirm', 'install', 'integrate', 'lock', 'verify', 'all', 'auto')]
     [string]$Action = 'detect',
 
     [string]$Version = '7.7.0',
@@ -801,6 +804,434 @@ function Invoke-Auto {
 }
 
 # ═══════════════════════════════════════════════════════════════
+# plan / confirm：先把「要改什么」摊开给人看，勾选后才动手
+# ═══════════════════════════════════════════════════════════════
+
+<#
+.SYNOPSIS
+    逐项算出「这一项现在什么状态、如果要改会写到哪里」，全程只读。
+
+.DESCRIPTION
+    返回 7 个条目，每条带三个字段：
+      id      动作标识，与 Invoke-PlanApply 里的分支一一对应
+      title   给人看的名字
+      where   会落到哪个文件 / 注册表键（写进确认窗口的第二列）
+      state   ready=已经到位、pending=需要改动、blocked=本机条件不满足
+      detail  一句话现状说明（悬停提示与 plan 输出共用）
+
+    这里刻意不复用 Invoke-Detect：那个函数是给「体检报告」用的，粒度和措辞
+    都不同（它把「别名缺失」和「未安装」分两条讲），而确认窗口需要的是
+    「做还是不做」这个二选一视图。两份判据同源（都读注册表/文件现状），
+    真正动手的函数也只有一套，所以不会出现判据分叉。
+#>
+function Get-PlanItems {
+    param(
+        [string]$Ver
+    )
+
+    $items = New-Object System.Collections.ArrayList
+
+    # ① PowerShell 7 本体：MSIX 用户级部署，下载落在 %TEMP%
+    $state = Get-Ps7State
+    if ($state.Installed) {
+        if ($state.Version -like ($Ver + '*')) {
+            $st = 'ready'
+            $dt = '已安装 ' + $state.Version
+        } else {
+            $st = 'pending'
+            $dt = '已安装 ' + $state.Version + '，将覆盖安装 ' + $Ver
+        }
+    } else {
+        $st = 'pending'
+        $dt = '未安装，将下载并安装 ' + $Ver + '（约 350 MB）'
+    }
+    [void]$items.Add([pscustomobject]@{
+        id     = 'install'
+        title  = '安装 PowerShell ' + $Ver
+        where  = '当前用户 MSIX 包；安装包下载到 %TEMP%\PowerShell-' + $Ver + '.msixbundle'
+        state  = $st
+        detail = $dt
+    })
+
+    # ② Windows Terminal 默认 profile
+    $tst = 'blocked'
+    $tdt = '未安装 Windows Terminal，本项跳过'
+    $tpkg = Get-AppxPackage -Name 'Microsoft.WindowsTerminal' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $tpkg) {
+        $tset = Join-Path $env:LOCALAPPDATA ('Packages\' + $tpkg.PackageFamilyName + '\LocalState\settings.json')
+        if (-not (Test-Path -LiteralPath $tset)) {
+            $tdt = '找不到 settings.json：' + $tset
+        } else {
+            try {
+                $ttext = Get-Content -LiteralPath $tset -Raw -Encoding UTF8
+                $hasEntry = $ttext -match [regex]::Escape($script:TerminalProfileGuid)
+                $isDefault = $ttext -match ('"defaultProfile"\s*:\s*"' + [regex]::Escape($script:TerminalProfileGuid) + '"')
+                if ($hasEntry -and $isDefault) {
+                    $tst = 'ready'
+                    $tdt = '默认 profile 已是 PowerShell 7'
+                } else {
+                    $tst = 'pending'
+                    $tdt = '将把 Windows Terminal 的默认 profile 指向 PowerShell 7'
+                }
+            } catch {
+                $tdt = '读取 settings.json 失败：' + $_.Exception.Message
+            }
+        }
+    }
+    [void]$items.Add([pscustomobject]@{
+        id     = 'terminal'
+        title  = 'Windows Terminal 默认 profile'
+        where  = 'Windows Terminal 的 settings.json（改前备份为 settings.json.ps7bak）'
+        state  = $tst
+        detail = $tdt
+    })
+
+    # ③ 系统默认终端委托：依赖终端包提供的两个 CLSID
+    $clsids = Get-TerminalHostClsids
+    if ($null -eq $clsids) {
+        $dst = 'blocked'
+        $ddt = '无法从 Windows Terminal 清单解析 CLSID，本项跳过'
+    } else {
+        $delegation = Get-ItemProperty -Path 'HKCU:\Console\%%Startup' -ErrorAction SilentlyContinue
+        if ($null -ne $delegation -and $delegation.DelegationConsole -and $delegation.DelegationTerminal -and ($delegation.DelegationConsole -ne $delegation.DelegationTerminal)) {
+            $dst = 'ready'
+            $ddt = '已委托给 Windows Terminal'
+        } else {
+            $dst = 'pending'
+            $ddt = '将把新开的控制台交给 Windows Terminal（不再回退 conhost）'
+        }
+    }
+    [void]$items.Add([pscustomobject]@{
+        id     = 'delegation'
+        title  = '系统默认终端委托'
+        where  = 'HKCU\Console\%%Startup（DelegationConsole / DelegationTerminal 两个值）'
+        state  = $dst
+        detail = $ddt
+    })
+
+    # ④ 资源管理器右键菜单
+    if (Test-Path -LiteralPath 'HKCU:\Software\Classes\Directory\shell\PowerShell7Here\command') {
+        $cst = 'ready'
+        $cdt = '右键菜单已存在'
+    } else {
+        $cst = 'pending'
+        $cdt = '将新增「在此处打开 PowerShell 7」菜单项'
+    }
+    [void]$items.Add([pscustomobject]@{
+        id     = 'contextmenu'
+        title  = '资源管理器右键菜单'
+        where  = 'HKCU\Software\Classes\Directory{,\Background}\shell\PowerShell7Here'
+        state  = $cst
+        detail = $cdt
+    })
+
+    # ⑤ App Paths：决定 Win+R 敲 powershell 落到哪个可执行文件
+    $appPath = Get-ItemProperty -Path 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\powershell.exe' -ErrorAction SilentlyContinue
+    if ($null -ne $appPath -and $appPath.'(default)' -like '*pwsh.exe') {
+        $ast = 'ready'
+        $adt = 'Win+R 敲 powershell 已指向 pwsh.exe'
+    } else {
+        $ast = 'pending'
+        $adt = '将把 Win+R / 运行框里的 powershell 导向 pwsh.exe'
+    }
+    [void]$items.Add([pscustomobject]@{
+        id     = 'apppaths'
+        title  = 'App Paths（Win+R 的 powershell）'
+        where  = 'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\powershell.exe'
+        state  = $ast
+        detail = $adt
+    })
+
+    # ⑥ .ps1 关联
+    $scriptCmd = (Get-ItemProperty -LiteralPath 'HKCU:\SOFTWARE\Classes\Microsoft.PowerShellScript.1\Shell\0\Command' -ErrorAction SilentlyContinue).'(default)'
+    if ($scriptCmd -like '*pwsh.exe*') {
+        $sst = 'ready'
+        $sdt = '.ps1 已用 PowerShell 7 打开'
+    } else {
+        $sst = 'pending'
+        $sdt = '将让 .ps1 双击默认用 PowerShell 7 打开'
+    }
+    [void]$items.Add([pscustomobject]@{
+        id     = 'ps1'
+        title  = '.ps1 文件关联'
+        where  = 'HKCU\SOFTWARE\Classes\Microsoft.PowerShellScript.1\Shell\0\Command'
+        state  = $sst
+        detail = $sdt
+    })
+
+    # ⑦ DSH 自身的执行器锁定
+    $patch = Get-DshPatchPath
+    if ($null -eq $patch) {
+        $lst = 'blocked'
+        $ldt = '找不到 DSH profile 配置目录，本项跳过'
+        $lwhere = '（未定位到 profile）'
+    } else {
+        $lwhere = $patch + '（改前备份为 cordis.patch.yml.ps7bak）'
+        $locked = $false
+        try {
+            $locked = ((Get-Content -LiteralPath $patch -Raw -Encoding UTF8) -match 'id:\s*pwsh-sandbox')
+        } catch {
+            $locked = $false
+        }
+        if ($locked) {
+            $lst = 'ready'
+            $ldt = 'DSH 已锁定在 PowerShell 7 上'
+        } else {
+            $lst = 'pending'
+            $ldt = '将往 profile 的 patch 层写入 pwsh-sandbox.pwshPath'
+        }
+    }
+    [void]$items.Add([pscustomobject]@{
+        id     = 'lock'
+        title  = '锁定 DSH 的 shell 到 PowerShell 7'
+        where  = $lwhere
+        state  = $lst
+        detail = $ldt
+    })
+
+    return $items
+}
+
+<#
+.SYNOPSIS
+    只读地把清单打成步骤行，供 ps7_bootstrap 的 plan 动作使用。
+#>
+function Invoke-Plan {
+    param(
+        [string]$Ver
+    )
+
+    $items = Get-PlanItems -Ver $Ver
+    foreach ($it in $items) {
+        $tag = switch ($it.state) {
+            'ready'   { '已就绪' }
+            'pending' { '待改动' }
+            default   { '无法执行' }
+        }
+        Add-Step ('plan.' + $it.id) ($it.state -eq 'ready') ('[' + $tag + '] ' + $it.title + ' → ' + $it.where + '；' + $it.detail)
+    }
+}
+
+<#
+.SYNOPSIS
+    弹确认窗口：逐条列出会改什么、写到哪里，勾选后返回选中的 id 列表。
+
+.DESCRIPTION
+    返回 $null 表示用户取消（必须一个字节都不写）。
+    返回空数组表示用户一个都没勾。
+
+    宿主以 windowsHide 方式起本脚本时，进程的 STARTUPINFO 带着 SW_HIDE，
+    Windows 会把本进程「第一次 ShowWindow」的 nCmdShow 强制成隐藏，
+    于是窗口建出来了却看不见。这里先显式 ShowWindow 一次把这个额度消耗掉，
+    再 ShowDialog，窗口才会真的出现在屏幕上（与 DSH 提示卡插件踩过的是同一个坑）。
+#>
+function Show-PlanDialog {
+    param(
+        $Items
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    if ($null -eq ('Ps7Dialog.Native' -as [type])) {
+        Add-Type -Namespace Ps7Dialog -Name Native -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+'@
+    }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'PowerShell 7 引导 · 确认改动'
+    $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $form.FormBorderStyle = 'FixedSingle'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.StartPosition = 'CenterScreen'
+    $form.TopMost = $true
+    $form.ClientSize = New-Object System.Drawing.Size(780, 500)
+
+    # 标题
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '下面这些改动会落在你的本机上，勾选后才会执行：'
+    $title.Location = New-Object System.Drawing.Point(16, 14)
+    $title.Size = New-Object System.Drawing.Size(748, 22)
+    $title.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10.5, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($title)
+
+    # 说明
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '灰色=已经到位，勾了也不会重复改；橙色=本机缺少依赖，做不了。取消则一个字节都不改。'
+    $hint.Location = New-Object System.Drawing.Point(16, 38)
+    $hint.Size = New-Object System.Drawing.Size(748, 20)
+    $hint.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+    $form.Controls.Add($hint)
+
+    # 清单：两列（改动项 / 会写到哪里），带复选框
+    $list = New-Object System.Windows.Forms.ListView
+    $list.Location = New-Object System.Drawing.Point(16, 64)
+    $list.Size = New-Object System.Drawing.Size(748, 320)
+    $list.View = 'Details'
+    $list.CheckBoxes = $true
+    $list.FullRowSelect = $true
+    $list.HeaderStyle = 'Nonclickable'
+    $list.ShowItemToolTips = $true
+    $list.MultiSelect = $false
+    [void]$list.Columns.Add('改动项', 240)
+    [void]$list.Columns.Add('会写到哪里', 480)
+
+    foreach ($it in $Items) {
+        $row = New-Object System.Windows.Forms.ListViewItem($it.title)
+        [void]$row.SubItems.Add($it.where)
+        $row.ToolTipText = $it.detail
+
+        if ($it.state -eq 'ready') {
+            $row.Checked = $false
+            $row.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 130)
+        } elseif ($it.state -eq 'pending') {
+            # 待改动的项默认全勾上：用户点「应用选中项」就是最常见的意图
+            $row.Checked = $true
+            $row.ForeColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
+        } else {
+            $row.Checked = $false
+            $row.ForeColor = [System.Drawing.Color]::FromArgb(190, 120, 20)
+        }
+
+        # id 挂在 Tag 上，收结果时不必再按标题反查
+        $row.Tag = $it.id
+        [void]$list.Items.Add($row)
+    }
+    $form.Controls.Add($list)
+
+    # 底部说明：备份与权限
+    $foot = New-Object System.Windows.Forms.Label
+    $foot.Text = '需要管理员权限：不需要（MSIX 用户级安装）。改动前都会留备份：settings.json.ps7bak / cordis.patch.yml.ps7bak。'
+    $foot.Location = New-Object System.Drawing.Point(16, 392)
+    $foot.Size = New-Object System.Drawing.Size(748, 36)
+    $foot.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+    $form.Controls.Add($foot)
+
+    # 按钮：应用 / 取消
+    $okBtn = New-Object System.Windows.Forms.Button
+    $okBtn.Text = '应用选中项'
+    $okBtn.Location = New-Object System.Drawing.Point(520, 444)
+    $okBtn.Size = New-Object System.Drawing.Size(120, 34)
+
+    $cancelBtn = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text = '取消，什么都不改'
+    $cancelBtn.Location = New-Object System.Drawing.Point(648, 444)
+    $cancelBtn.Size = New-Object System.Drawing.Size(120, 34)
+
+    $form.Controls.Add($okBtn)
+    $form.Controls.Add($cancelBtn)
+    $form.AcceptButton = $okBtn
+    $form.CancelButton = $cancelBtn
+
+    # 结果容器：$null 表示取消
+    $script:PlanChosen = $null
+
+    $okBtn.Add_Click({
+        $picked = New-Object System.Collections.ArrayList
+        foreach ($row in $list.Items) {
+            if ($row.Checked) { [void]$picked.Add($row.Tag) }
+        }
+        $script:PlanChosen = $picked
+        $form.Close()
+    })
+
+    $cancelBtn.Add_Click({
+        $script:PlanChosen = $null
+        $form.Close()
+    })
+
+    # 先 Show 再自己补一次 ShowWindow：
+    # 宿主以 windowsHide 起本进程时，STARTUPINFO 带 SW_HIDE，Windows 会把本进程
+    # 「第一次 ShowWindow」的 nCmdShow 强制成隐藏——于是窗口建出来却看不见。
+    # 第一次已经被 Show() 消耗掉，第二次起到的是真实参数，窗口才真的出现在屏幕上。
+    #
+    # 用 Show() + 自转消息循环而不是 ShowDialog()：ShowWindow 已经让窗口可见，
+    # 此时再调 ShowDialog 会抛「Form that is already visible cannot be displayed
+    # as a modal dialog box」，而且这一步在 5.1 里只会在 stderr 留一行异常，
+    # 用户侧表现为「窗口一闪而过」，极难查。
+    $form.Show()
+    [void][Ps7Dialog.Native]::ShowWindow($form.Handle, 5)
+    [void][Ps7Dialog.Native]::SetForegroundWindow($form.Handle)
+    $form.Activate()
+
+    while (-not $form.IsDisposed -and $form.Visible) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 40
+    }
+    $form.Dispose()
+
+    return $script:PlanChosen
+}
+
+<#
+.SYNOPSIS
+    按用户勾选的 id 执行对应的落盘动作（顺序固定，互不依赖）。
+#>
+function Invoke-PlanApply {
+    param(
+        [string[]]$Ids,
+        [string]$Ver,
+        [string]$MirrorPrefix,
+        [bool]$ForceReinstall
+    )
+
+    if ($Ids -contains 'install') {
+        Invoke-Install -Ver $Ver -MirrorPrefix $MirrorPrefix -ForceReinstall $ForceReinstall
+    }
+    if ($Ids -contains 'terminal') { Set-TerminalDefaultProfile }
+    if ($Ids -contains 'delegation') { Set-TerminalDelegation }
+    if ($Ids -contains 'contextmenu') { Set-ExplorerContextMenu }
+    if ($Ids -contains 'apppaths') { Set-AppPaths }
+    if ($Ids -contains 'ps1') { Set-ScriptAssociation }
+    if ($Ids -contains 'lock') { Invoke-Lock }
+}
+
+<#
+.SYNOPSIS
+    confirm：清单 → 确认窗口 → 只执行勾选项 → 校验。
+#>
+function Invoke-Confirm {
+    param(
+        [string]$Ver,
+        [string]$MirrorPrefix,
+        [bool]$ForceReinstall
+    )
+
+    $items = Get-PlanItems -Ver $Ver
+    $pending = @($items | Where-Object { $_.state -eq 'pending' })
+
+    # 已经什么都不用做时，不打扰用户：连窗口都不弹
+    if ($pending.Count -eq 0) {
+        Add-Step 'confirm' $true '本机已就绪，无需任何改动（未弹确认窗口）'
+        return
+    }
+
+    $chosen = Show-PlanDialog -Items $items
+
+    if ($null -eq $chosen) {
+        Add-Step 'confirm' $true '用户取消，未做任何改动'
+        return
+    }
+
+    # PS 5.1 里 ArrayList 为空时会被当成标量，统一成数组再判
+    $ids = @($chosen)
+    if ($ids.Count -eq 0) {
+        Add-Step 'confirm' $true '未勾选任何项，未做任何改动'
+        return
+    }
+
+    Add-Step 'confirm.approved' $true ('用户确认执行：' + ($ids -join ', '))
+    Invoke-PlanApply -Ids $ids -Ver $Ver -MirrorPrefix $MirrorPrefix -ForceReinstall $ForceReinstall
+
+    # 校验一律跑：只读，且能让用户在结果里看到最终状态
+    Invoke-Verify
+}
+
+# ═══════════════════════════════════════════════════════════════
 # 主调度
 # ═══════════════════════════════════════════════════════════════
 
@@ -812,6 +1243,8 @@ if (-not $Quiet) {
 
 switch ($Action) {
     'detect'    { Invoke-Detect }
+    'plan'      { Invoke-Plan -Ver $Version }
+    'confirm'   { Invoke-Confirm -Ver $Version -MirrorPrefix $Mirror -ForceReinstall $Force.IsPresent }
     'install'   { Invoke-Install -Ver $Version -MirrorPrefix $Mirror -ForceReinstall $Force.IsPresent }
     'integrate' { Invoke-Integrate }
     'lock'      { Invoke-Lock }

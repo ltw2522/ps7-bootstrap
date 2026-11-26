@@ -22,18 +22,21 @@ DSH 的 shell 插件（`@deepseek-ai/dsh-pwsh-sandbox`）在 **进程启动时**
    plugin_manager(action: "install_bundle", target: "D:\\ps7-bootstrap")
    ```
 
-**没有第三步。** 插件加载后约 2 秒会自己跑一次 `auto`：先查 `WindowsApps\pwsh.exe` 别名在不在、再查当前 profile 的 patch 有没有 `pwsh-sandbox` 条目，缺什么补什么。PS7 没装就自动下载安装（约 350 MB），装好了就一路把终端集成和 `pwshPath` 锁定做完。
+**第三步是看一张确认卡。** 插件加载后约 2 秒会先算一份清单：本机已装什么、还差什么、每一项会写到哪里。只要还有待改的项，就会弹一个窗口把清单摊开——每行写明「会写哪个文件 / 哪个注册表键」，默认勾选待改项，你自己决定勾哪几行，点「应用选中项」才动手；点「取消，什么都不改」则一个字节都不写。
 
-想确认结果、或者不想等自动流程：
+![确认窗口：逐条列出会写到哪里](docs/screenshots/confirm-plan.png)
+
+已经配置好的机器连窗口都不会弹（两次文件探测就判定就绪）。想确认结果、或者不想等自动流程：
 
 ```
+ps7_bootstrap(action: "plan")      # 只读，列出会改什么、现在什么状态
+ps7_bootstrap(action: "confirm")   # 弹确认窗口，勾选后执行（默认动作）
 ps7_bootstrap(action: "verify")    # 只读，看四项是否都 ✓
-ps7_bootstrap(action: "auto")      # 手动触发一次同样的智能引导
 ```
 
 不需要重启 DSH：profile 的 patch 层是热重载的，`pwshPath` 的 getter 比对到配置变化会立即重新解析。
 
-### 想关掉自动行为
+### 想改自动行为
 
 在 profile 的 `cordis.patch.yml` 里给本插件加配置：
 
@@ -41,22 +44,26 @@ ps7_bootstrap(action: "auto")      # 手动触发一次同样的智能引导
 - id: ps7-bootstrap-tool
   name: ps7-bootstrap
   config:
-    autoRun: lock-only    # 只锁 pwshPath，不下载、不碰终端和注册表
-    # autoRun: off        # 加载时完全不动，全靠手动调工具
+    autoRun: ask           # 默认：弹确认窗口，勾选后才改
+    # autoRun: off         # 加载时完全不动，全靠手动调工具
+    # autoRun: lock-only   # 只锁 pwshPath，不下载、不碰终端和注册表
+    # autoRun: full        # 旧行为：不问，缺什么补什么（无人值守机器才这么配）
 ```
 
-默认是 `full`（缺什么补什么）。自动引导不阻塞启动，失败也不影响 DSH——结果只记在模块内的 `lastAutoRun` 里。
+自动引导不阻塞启动，失败也不影响 DSH——结果只记在模块内的 `lastAutoRun` 里。
 
 ## 它到底改了什么
 
 | 步骤 | 动作 | 作用域 |
 | --- | --- | --- |
+| `plan` | 只读列出 7 个候选改动项：状态（已就绪/待改动/无法执行）+ 落点 | 只读 |
+| `confirm` | 弹确认窗口，逐行展示落点，勾选后才执行；取消即零改动 | 由用户勾选决定 |
 | `detect` | 查 PS7 是否已装、别名是否存在、各项注册表当前值 | 只读 |
 | `install` | 下载 `PowerShell-7.7.0.msixbundle` 并 `Add-AppxPackage` | 用户级，**不需要管理员** |
 | `integrate` | 终端委托、WT 默认 profile、右键菜单、App Paths、`.ps1` 关联 | 全部 HKCU |
 | `lock` | 在 DSH profile 的 `cordis.patch.yml` 里写死 `pwshPath` | 只写当前 profile |
 | `verify` | **实跑**四项，不只看注册表有没有键 | 只读 |
-| `auto` | 先廉价判定，已就绪就一步不动，有缺口才补 | 视缺口而定 |
+| `auto` / `all` | 不问用户的批量路径，只在明确要求时用 | 视缺口而定 |
 
 `lock` 是真正让「DSH 不打架」的那一步。只装插件不跑 `lock`，命令照样跑在 5.1 上。
 

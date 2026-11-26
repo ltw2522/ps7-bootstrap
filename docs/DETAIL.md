@@ -10,37 +10,39 @@ The 5.1 build that ships with Windows is an OS component: it can be run side by 
 
 | action | effect | touches the system |
 | --- | --- | --- |
+| `plan` | List the seven candidate changes with their state (ready / pending / blocked) and destination | read-only |
+| `confirm` | Show that list in a confirmation window — one row per change, naming the file or registry key it writes — and apply only what is ticked | whatever the user ticks |
 | `detect` | Report install state, execution alias, terminal delegation, App Paths | read-only |
 | `install` | Download the MSIX and deploy it for the current user | installs a package |
 | `integrate` | Terminal default profile, terminal delegation, Explorer context menu, `Win+R` resolution, `.ps1` association | writes HKCU and Terminal settings.json |
 | `lock` | Pin `pwshPath` in the DSH profile patch layer | writes `~/.dsh/profiles/<profile>/cordis.patch.yml` |
 | `verify` | Run pwsh for its real version and re-check every gate above | read-only |
-| `all` | `install` → `integrate` → `lock` → `verify` | everything |
-| `auto` | Cheap check first: nothing to do means nothing happens; gaps get filled | depends on the gap |
+| `all` / `auto` | Non-interactive batch paths (`auto` runs the cheap check first) | everything / depends on the gap |
 
 Every action is idempotent: re-running fills in what is missing instead of duplicating entries.
 
-## Installing the plugin is the whole setup
+## Loading the plugin shows a confirmation card first
 
-`auto` runs once when the plugin loads, so in the normal path you never have to call anything by hand — install the plugin, wait a few seconds, done.
+About two seconds after load the plugin works out one list: what is installed, what is missing, and where each change would land. If anything is pending it opens a window with that list — two columns, the change on the left and its destination (file path or registry key) on the right, with the current state as a hover hint. Pending rows are ticked, already-satisfied rows are greyed out (ticking them changes nothing), rows missing a dependency are orange.
 
-Its first step is deliberately cheap: check whether the `WindowsApps\pwsh.exe` alias exists and whether the current profile's patch already carries a `pwsh-sandbox` entry. Both present and it returns immediately without spawning a child process. Whatever is missing gets filled; if 7 is already installed no network is touched.
+"Apply selected" runs only the ticked rows and then re-runs `verify`; "Cancel" writes nothing at all — not even a backup file. Machines that are already configured never see the window: two filesystem probes settle it.
 
 The behaviour is controlled by the `autoRun` config key:
 
 | value | behaviour |
 | --- | --- |
-| `full` (default) | Fill every gap, including downloading and installing 7 when absent |
-| `lock-only` | Only pin `pwshPath`; no downloads, no terminal or registry changes |
+| `ask` (default) | Show the confirmation window; apply what the user ticks |
 | `off` | Do nothing on load; drive everything through `ps7_bootstrap` manually |
+| `lock-only` | Only pin `pwshPath`; no downloads, no terminal or registry changes |
+| `full` | Legacy: fill every gap without asking (unattended machines only) |
 
-To stop the automatic download, add one line to this plugin's entry in the profile's `cordis.patch.yml`:
+To adjust it, add one line to this plugin's entry in the profile's `cordis.patch.yml`:
 
 ```yaml
 - id: ps7-bootstrap-tool
   name: ps7-bootstrap
   config:
-    autoRun: lock-only
+    autoRun: off
 ```
 
 The automatic run never blocks startup and its failure never affects the host: the outcome is kept in the module's `lastAutoRun`, and `ps7_bootstrap(action:"verify")` always tells you the real state.

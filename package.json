@@ -1,7 +1,7 @@
 {
   "name": "ps7-bootstrap",
   "description": "Install PowerShell 7 on Windows and pin the DeepSeek Harness shell to it.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "icon": "./icon.svg",
   "type": "module",
   "main": "index.js",

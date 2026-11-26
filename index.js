@@ -54,7 +54,15 @@ const MARKER = '##PS7RESULT##';
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** 可用动作集合，供 schema 与运行期双重校验共用。 */
-const ACTIONS = ['detect', 'install', 'integrate', 'lock', 'verify', 'all', 'auto'];
+const ACTIONS = ['detect', 'plan', 'confirm', 'install', 'integrate', 'lock', 'verify', 'all', 'auto'];
+
+/**
+ * 需要弹确认窗口的动作。
+ *
+ * 这类动作要等真人在窗口上点按钮，所以不能挂超时：挂上就等于
+ * 「用户去泡了杯茶回来，插件已经把自己的引导窗口掐死了」。
+ */
+const INTERACTIVE_ACTIONS = new Set(['confirm']);
 
 /**
  * 调起引导脚本并收集输出。
@@ -66,10 +74,14 @@ const ACTIONS = ['detect', 'install', 'integrate', 'lock', 'verify', 'all', 'aut
  */
 function runBootstrap(action, options, signal) {
   const { version, mirror, force, timeoutMs } = options;
+  const interactive = INTERACTIVE_ACTIONS.has(action);
 
   return new Promise((resolve, reject) => {
     // -ExecutionPolicy Bypass：目标机器可能仍是 Restricted，否则脚本直接被拒
+    // -Sta：确认窗口是 WinForms，必须在单线程套间里跑（powershell.exe 默认就是
+    //       STA，但显式写出来，免得将来有人换成 pwsh 宿主时窗口线程报错）
     const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT, '-Action', action, '-Version', version];
+    if (INTERACTIVE_ACTIONS.has(action)) args.splice(0, 0, '-Sta');
     if (mirror !== undefined && mirror.length > 0) args.push('-Mirror', mirror);
     if (force === true) args.push('-Force');
 
@@ -104,10 +116,13 @@ function runBootstrap(action, options, signal) {
       signal.addEventListener('abort', onAbort, { once: true });
     }
 
-    timer = setTimeout(() => {
-      child.kill();
-      finish(reject, new Error(`ps7_bootstrap: 超过 ${Math.round(timeoutMs / 60000)} 分钟未完成，已终止`));
-    }, timeoutMs);
+    timer = undefined;
+    if (!interactive) {
+      timer = setTimeout(() => {
+        child.kill();
+        finish(reject, new Error(`ps7_bootstrap: 超过 ${Math.round(timeoutMs / 60000)} 分钟未完成，已终止`));
+      }, timeoutMs);
+    }
 
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
@@ -192,11 +207,13 @@ const ps7Tool = {
         type: 'string',
         enum: ACTIONS,
         description:
-          'detect 只读检查现状；install 下载并安装；integrate 写系统集成（终端默认 profile、'
-          + '系统默认终端委托、资源管理器右键、Win+R 的 powershell 解析、.ps1 关联）；'
-          + 'lock 把 DSH 的 pwshPath 钉死到 7；verify 实跑校验；'
-          + 'all 依次跑 install → integrate → lock → verify；'
-          + 'auto 先做廉价判定，已就绪就一步不动、有缺口才补（插件加载时自动调用这个）。',
+          'plan 只读列出「会改哪些设置、写到哪里、现在什么状态」；'
+          + 'confirm 弹确认窗口，把同一份清单摊给用户看，勾选后才执行（默认动作）；'
+          + 'detect 只读检查现状；install 下载并安装；'
+          + 'integrate 写系统集成（终端默认 profile、系统默认终端委托、资源管理器右键、'
+          + 'Win+R 的 powershell 解析、.ps1 关联）；lock 把 DSH 的 pwshPath 钉死到 7；'
+          + 'verify 实跑校验；all 依次跑 install → integrate → lock → verify（不问用户，慎用）；'
+          + 'auto 先做廉价判定，已就绪就一步不动、有缺口才补（同样不问用户）。',
       },
       version: {
         type: 'string',
@@ -329,7 +346,17 @@ function looksReady() {
 let lastAutoRun = null;
 
 /**
- * 按配置安排一次自动引导，让「装上插件」和「配置到位」合并成一件事。
+ * 按配置安排一次自动引导。
+ *
+ * 默认 `ask`：先把「要改什么」列成清单弹给用户，勾选后才动手。
+ * 这一改动是为了让「装插件」不再等于「默默改系统」——安装 PowerShell 7、
+ * 改终端默认 profile、写注册表这类动作，必须先让人看到落点再决定。
+ *
+ * 四个模式：
+ *   ask        （默认）弹确认窗口，用户勾选后只执行选中项；用户在窗口上取消即零改动
+ *   off        完全不自动跑，只留手动调用的工具
+ *   full       旧行为：不询问，直接 auto（适合无人值守机器，需用户自己显式选）
+ *   lock-only  只写 DSH 的 pwshPath 锁定条目，不做安装与系统集成
  *
  * 三个取舍：
  *   - 延迟 2 秒启动，把 IO 让给 DSH 自己的初始化；
@@ -338,13 +365,15 @@ let lastAutoRun = null;
  *     失败只记进 lastAutoRun，用户随时能手动跑 ps7_bootstrap 补。
  */
 function scheduleAutoRun(ctx, config) {
-  const mode = config?.autoRun ?? 'full';
+  const mode = config?.autoRun ?? 'ask';
   if (mode === 'off') return;
 
-  // 已经配好的机器：连子进程都不起
+  // 已经配好的机器：连子进程都不起（确认窗口也不弹）
   if (looksReady()) return;
 
-  const action = mode === 'lock-only' ? 'lock' : 'auto';
+  let action = 'confirm';
+  if (mode === 'lock-only') action = 'lock';
+  else if (mode === 'full') action = 'auto';
 
   const timer = setTimeout(() => {
     runBootstrap(action, { version: '7.7.0', timeoutMs: DEFAULT_TIMEOUT_MS })
