@@ -1,10 +1,13 @@
 {
   "name": "ps7-bootstrap",
   "description": "Install PowerShell 7 on Windows and pin the DeepSeek Harness shell to it.",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "icon": "./icon.svg",
   "type": "module",
   "main": "index.js",
+  "engines": {
+    "dsh": ">=0.2.0-0 <0.3.0-0"
+  },
   "exports": {
     ".": "./index.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
